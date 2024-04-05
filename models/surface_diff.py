@@ -12,6 +12,8 @@ from models.EGNN import ATT_EGNN
 # from torchph.pershom import vr_persistence_l1
 from torch_geometric.nn import radius_graph, knn_graph
 
+from ep_ab.models.dmasif import dMaSIF
+
 def exists(x):
     return x is not None
 
@@ -340,12 +342,10 @@ class surface_diff(nn.Module):
             nn.Linear(self.hidden_dim, 520),
         )
 
-    def forward(self, protein_pos, protein_v, protein_ph, batch_protein, batch_is_in_pocket, init_ligand_pos, init_ligand_v, ligand_ph, batch_ligand,
-                init_motif_wid,init_motif_pos, batch_motif,
-                time_step=None, return_all=False, fix_x=False):
+        self.surface_encoder = dMaSIF(config.masif)
 
-        init_ligand_v = F.one_hot(init_ligand_v, self.num_classes).float()
-        init_motif_v = F.one_hot(init_motif_wid, self.num_classes_motif).float()
+    def forward(self, , time_step=None, return_all=False, fix_x=False):
+
         # time embedding
         if self.time_emb_dim > 0:
             if self.time_emb_mode == 'simple':
@@ -361,10 +361,17 @@ class surface_diff(nn.Module):
             input_ligand_feat = init_ligand_v
             input_motif_feat = init_motif_v
 
-        if self.config.protein_ph_feature:
-            protein_ph_batch = protein_ph[batch_protein]
-            protein_ph_batch = self.protein_ph_emb(protein_ph_batch)
-            protein_v = torch.cat([protein_v, protein_ph_batch], -1)
+        patch_feat_receptor, patch_idx_receptor, patch_xyz_receptor, patch_mask_receptor, _, _ = self.point_forward(P_receptor)
+
+        patch_feat_ligand, _, _, patch_mask_ligand, _, _ = self.point_forward(P_ligand)
+
+        # Transformer
+        patch_feat_receptor = self.patch_forward(patch_feat_receptor, patch_xyz_receptor, patch_feat_=patch_feat_ligand,
+                                                 patch_mask=patch_mask_receptor.unsqueeze(1).unsqueeze(
+                                                     2) if patch_mask_receptor is not None else None,
+                                                 patch_mask_=patch_mask_ligand.unsqueeze(1).unsqueeze(
+                                                     2) if patch_mask_ligand is not None else None)
+        pred_coarse = self.classifier(patch_feat_receptor).squeeze(-1)
 
         h_protein = self.protein_atom_emb(protein_v)
         init_ligand_h = self.ligand_atom_emb(input_ligand_feat)
@@ -380,23 +387,12 @@ class surface_diff(nn.Module):
             init_motif_h = torch.cat([init_motif_h, bit_mask[2].expand(len(init_motif_h), -1).to(h_protein)], -1)
 
         h_all, pos_all, batch_all, mask_ligand, mask_pocket, mask_motif, mask_protein = compose_context(
-            h_protein=h_protein,
-            h_ligand=init_ligand_h,
 
-            pos_protein=protein_pos,
-            pos_ligand=init_ligand_pos,
-
-            batch_protein=batch_protein,
-            batch_ligand=batch_ligand,
-            is_in_pocket = batch_is_in_pocket,
-
-            h_motif = init_motif_h,
-            pos_motif=init_motif_pos,
-            batch_motif = batch_motif,
 
         )
 
         outputs = self.refine_net(h_all, pos_all, mask_ligand, mask_pocket, mask_motif, mask_protein, batch_all, return_all=return_all, fix_x=fix_x)
+
         final_pos, final_h = outputs['x'], outputs['h']
         final_ligand_pos, final_ligand_h = final_pos[mask_ligand], final_h[mask_ligand]
         final_motif_pos, final_motif_h = final_pos[mask_motif], final_h[mask_motif]
@@ -405,23 +401,34 @@ class surface_diff(nn.Module):
         final_motif_v = self.v_inference_motif(final_motif_h)
 
         preds = {
-            'pred_ligand_pos': final_ligand_pos,
-            'pred_ligand_v': final_ligand_v,
-            'final_h': final_h,
-            'final_ligand_h': final_ligand_h,
-            'pred_motif_pos': final_motif_pos,
-            'pred_motif_v': final_motif_v
+
 
         }
-        if return_all:
-            final_all_pos, final_all_h = outputs['all_x'], outputs['all_h']
-            final_all_ligand_pos = [pos[mask_ligand] for pos in final_all_pos]
-            final_all_ligand_v = [self.v_inference(h[mask_ligand]) for h in final_all_h]
-            preds.update({
-                'layer_pred_ligand_pos': final_all_ligand_pos,
-                'layer_pred_ligand_v': final_all_ligand_v
-            })
+
         return preds
+
+    def point_forward(self, P, ):
+        feat = self.surface_encoder(P)  # feat: (N, D)
+        xyz_dense, mask = to_dense_batch(P['xyz'], P['batch'], fill_value=0.0)  # xyz_dense: (B, L, 3), mask: (B, L)
+        feat_dense, _ = to_dense_batch(feat, P['batch'], fill_value=0.0)  # feat_dense: (B, L, D)
+        if self.fixed_patches:
+            patch_mask = None
+            patch_idx = farthest_point_sample(xyz_dense, self.n_patches, mask)  # patch_idx: (B, npatch)
+            patch_xyz = index_points(xyz_dense, patch_idx)  # patch_xyz: (B, npatch, 3)
+        else:
+            # https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.pool.fps.html
+            patch_idx = fps(P['xyz'], P['batch'], ratio=self.patch_ratio)  # patch_idx: (B x L)
+            patch_xyz, patch_mask = to_dense_batch(P['xyz'][patch_idx], P['batch'][patch_idx],
+                                                   fill_value=0.0)  # patch_xyz: (B, npatch, 3), patch_mask: (B, npatch)
+
+        dists = square_distance(xyz_dense, patch_xyz)  # dists: (B, L, npatch)
+        dists[~mask] = 1e10
+        _, group_idx = dists.transpose(1, 2).contiguous().topk(self.n_pts_per_patch,
+                                                               largest=False)  # group_idx: (B, npatch, n_pts)
+        grouped_feat = index_points(feat_dense, group_idx)  # grouped_feat: (B, npatch, n_pts, D)
+        patch_feat = grouped_feat.max(-2)[0]  # patch_feat: (B, npatch, D)
+        return patch_feat, patch_idx, patch_xyz, patch_mask, xyz_dense, group_idx
+
 
     # atom type diffusion process
     def q_v_pred_one_timestep(self, log_vt_1, t, batch, num_classes):
@@ -564,14 +571,12 @@ class surface_diff(nn.Module):
         # print(loss_ph_all)
         return  loss_ph_all
 
-    def get_diffusion_loss(
-            self, protein_pos, protein_v, protein_ph, batch_protein, batch_is_in_pocket, ligand_pos, ligand_v, ligand_ph, batch_ligand,
+    def get_diffusion_loss(self, protein_pos, protein_v, protein_ph, batch_protein, batch_is_in_pocket, ligand_pos, ligand_v, ligand_ph, batch_ligand,
              motif_pos, motif_wid, batch_motif, time_step=None,):
 
         num_graphs = batch_protein.max().item() + 1
 
-        protein_pos, ligand_pos, motif_pos, offset = center_pos(
-            protein_pos, ligand_pos, motif_pos, batch_protein, batch_ligand, batch_motif, mode=self.center_pos_mode)
+        protein_pos, ligand_pos, motif_pos, offset = center_pos(protein_pos, ligand_pos, motif_pos, batch_protein, batch_ligand, batch_motif, mode=self.center_pos_mode)
 
         # receptor
         if self.fixed_patches:
