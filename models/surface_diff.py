@@ -22,6 +22,18 @@ def default(val, d):
         return val
     return d() if callable(d) else d
 
+def square_distance(src, dst):
+    """
+    Calculate Euclid distance between each two points.
+    Input:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Output:
+        dist: per-point square distance, [B, N, M]
+    """
+    return torch.sum((src[:, :, None] - dst[:, None]) ** 2, dim=-1)
+
+
 def get_refine_net(config):
 
     refine_net = ATT_EGNN(
@@ -344,7 +356,7 @@ class surface_diff(nn.Module):
 
         self.surface_encoder = dMaSIF(config.masif)
 
-    def forward(self, , time_step=None, return_all=False, fix_x=False):
+    def forward(self, P_receptor, P_ligand, time_step=None, return_all=False, fix_x=False):
 
         # time embedding
         if self.time_emb_dim > 0:
@@ -571,11 +583,9 @@ class surface_diff(nn.Module):
         # print(loss_ph_all)
         return  loss_ph_all
 
-    def get_diffusion_loss(self, protein_pos, protein_v, protein_ph, batch_protein, batch_is_in_pocket, ligand_pos, ligand_v, ligand_ph, batch_ligand,
-             motif_pos, motif_wid, batch_motif, time_step=None,):
+    def get_diffusion_loss(self, batch, time_step=None,):
 
         num_graphs = batch_protein.max().item() + 1
-
         protein_pos, ligand_pos, motif_pos, offset = center_pos(protein_pos, ligand_pos, motif_pos, batch_protein, batch_ligand, batch_motif, mode=self.center_pos_mode)
 
         # receptor
@@ -632,18 +642,12 @@ class surface_diff(nn.Module):
             init_motif_wid = motif_wid
 
         preds = self(
-            protein_pos=protein_pos,
-            protein_v=protein_v,
-            protein_ph = protein_ph,
-            batch_protein=batch_protein,
-            batch_is_in_pocket = batch_is_in_pocket,
-
+            P_receptor = P_receptor,
+            P_ligand = P_ligand,
             time_step=time_step,
-
         )
 
         pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
-        pred_motif_pos, pred_motif_v = preds['pred_motif_pos'], preds['pred_motif_v']
         pred_pos_noise = pred_ligand_pos - ligand_pos_perturbed
         # atom position
         if self.model_mean_type == 'noise':
@@ -653,7 +657,8 @@ class surface_diff(nn.Module):
             pos_model_mean = self.q_pos_posterior(x0=pred_ligand_pos, xt=ligand_pos_perturbed, t=time_step, batch=batch_ligand)
         else:
             raise ValueError
-        loss, loss_pos, loss_pos_motif, loss_v, loss_v_motif = 0, 0, 0, 0, 0
+
+        loss, loss_pos, loss_v = 0, 0, 0, 0, 0
         # atom pos loss
         if self.model_mean_type == 'C0':
             target, pred = ligand_pos, pred_ligand_pos
@@ -666,18 +671,6 @@ class surface_diff(nn.Module):
 
         loss = loss_pos
 
-        # motif pos loss
-        if self.model_mean_type == 'C0':
-            target_motif, pred_motif = motif_pos, pred_motif_pos
-        elif self.model_mean_type == 'noise':
-            target, pred = pos_noise, pred_pos_noise
-        else:
-            raise ValueError
-        loss_pos_motif = scatter_mean(((pred_motif - target_motif) ** 2).sum(-1), batch_motif, dim=0)
-        loss_pos_motif = torch.mean(loss_pos_motif)
-
-        loss  = loss + loss_pos_motif * self.config.motif_pos_weight
-
         # atom type loss
         log_ligand_v_recon = F.log_softmax(pred_ligand_v, dim=-1)
         log_v_model_prob = self.q_v_posterior(log_ligand_v_recon, log_ligand_vt, time_step, batch_ligand, self.num_classes)
@@ -688,25 +681,8 @@ class surface_diff(nn.Module):
 
         loss  = loss + loss_v * self.loss_v_weight
 
-        # motif type loss
-        if self.config.perturb_motif_wid == True:
-            log_motif_v_recon = F.log_softmax(pred_motif_v, dim=-1)
-            log_v_model_prob_motif = self.q_v_posterior(log_motif_v_recon, log_motif_vt, time_step, batch_motif, self.num_classes_motif)
-            log_v_true_prob_motif = self.q_v_posterior(log_motif_v0, log_motif_vt, time_step, batch_motif, self.num_classes_motif)
-            kl_v_motif = self.compute_v_Lt(log_v_model_prob=log_v_model_prob_motif, log_v0=log_motif_v0,
-                                     log_v_true_prob=log_v_true_prob_motif, t=time_step, batch=batch_motif)
-            loss_v_motif = torch.mean(kl_v_motif)
-
-            loss = loss + loss_v_motif * self.config.motif_wid_weight
-
         # Persist Homology loss
 
-        if self.config.ph_loss:
-            loss_ph = self.compute_ph_Lt(pred_ligand_pos, ligand_pos, batch_ligand)
-            loss_ph = torch.mean(loss_ph)
-            loss = loss + loss_ph * self.config.ph_loss_weight
-        else:
-            loss_ph = 0
 
         return {
             'loss_pos': loss_pos,
