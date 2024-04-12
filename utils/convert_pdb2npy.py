@@ -1,7 +1,9 @@
 import numpy as np
+import sys
+sys.path.append('/home/gli/project/DVAE/Diffsurface')
 from Bio.PDB import *
 from tqdm import tqdm
-from ep_ab.utils.protein.constants import AA
+from utils.protein.constants import AA
 
 ele2num = {"C": 0, "H": 1, "O": 2, "N": 3, "S": 4, "SE": 5}  # 6 atom types in the residue
 num2ele = {0: 'C', 1: 'H', 2: 'O', 3: 'N', 4: 'S', 5: 'SE'}

@@ -1,19 +1,18 @@
 import os
+import sys
+sys.path.append('/home/gli/project/DVAE/Diffsurface')
 import logging
-
 import pandas as pd
 from Bio.PDB import PDBExceptions
-
 import pickle
 import joblib
 from tqdm import tqdm
-
 import lmdb
 import torch
 from torch.utils.data import Dataset
-from ep_ab.utils.protein.points import ProteinPairData
-from ep_ab.utils.convert_pdb2npy import load_seperate_structure
-from ep_ab.utils.geometry import atoms_to_points
+from utils.protein.points import ProteinPairData
+from utils.convert_pdb2npy import load_seperate_structure
+from utils.geometry import atoms_to_points
 
 Tensor, tensor = torch.LongTensor, torch.FloatTensor
 
@@ -200,7 +199,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--split', type=str, default='train')
-    parser.add_argument('--processed_dir', type=str, default='./data/processed')
+    parser.add_argument('--processed_dir', type=str, default='/home/gli/project/Data/data_surface/processed')
     parser.add_argument('--reset', action='store_true', default=False)
     args = parser.parse_args()
     if args.reset:
